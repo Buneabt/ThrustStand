@@ -1,0 +1,349 @@
+# VLEO Chamber Verification - Shiny App
+# GWU Systems Engineering Capstone Project
+library(shiny)
+library(shinyjs)
+library(rvest)
+library(dplyr)
+
+# Load Earth atmospheric data
+load_atmospheric_data <- function(csv_file = 'data/msise_atmospheric_data_clean.csv') {
+    df <- read.csv(csv_file)
+    df$density_kg_m3 <- df$Total_mass_density * 1000
+    return(df)
+}
+
+# Load Mars atmospheric data
+load_mars_data <- function() {
+    url_mars <- "http://www.braeunig.us/space/atmmars.htm"
+    df <- read_html(url_mars) %>% 
+        html_table() %>% 
+        .[[3]] %>% 
+        .[-2,]
+    colnames(df) <- df[1,]
+    df <- df[-1,]
+    
+    # Convert altitude to numeric (remove commas and convert from meters to km)
+    df$Altitude_km <- as.numeric(gsub(",", "", df$`Altitude(meters)`))
+    # Convert density to numeric (kg/m3)
+    df$density_kg_m3 <- as.numeric(df$`Density(kg/m3)`)
+    
+    return(df)
+}
+
+# Load data at startup
+atm_data_earth <- load_atmospheric_data()
+atm_data_mars <- load_mars_data()
+
+get_altitude_for_density <- function(density_kg_m3, planet = "Earth") {
+    if (planet == "Mars") {
+        approx(atm_data_mars$density_kg_m3, atm_data_mars$Altitude_km, density_kg_m3)$y
+    } else {
+        approx(atm_data_earth$density_kg_m3, atm_data_earth$Altitude_km, density_kg_m3)$y
+    }
+}
+
+get_density_for_altitude <- function(altitude_km, planet = "Earth") {
+    if (planet == "Mars") {
+        approx(atm_data_mars$Altitude_km, atm_data_mars$density_kg_m3, altitude_km)$y
+    } else {
+        approx(atm_data_earth$Altitude_km, atm_data_earth$density_kg_m3, altitude_km)$y
+    }
+}
+
+ui <- fluidPage(
+    useShinyjs(),
+    titlePanel("VLEO Chamber Verification"),
+    h4("GWU Systems Engineering Capstone Project"),
+    hr(),
+    
+    tags$head(tags$style(HTML("
+        .solve-buttons .btn {
+            width: 100px;
+            height: 60px;
+            margin: 5px;
+            font-size: 14px;
+            font-weight: bold;
+        }
+        .solve-buttons {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .btn-active {
+            background-color: #337ab7;
+            color: white;
+        }
+    "))),
+    
+    fluidRow(
+        column(4,
+               wellPanel(
+                   h4("Chamber Conditions"),
+                   
+                   selectInput("planet",
+                               "Atmospheric Body:",
+                               choices = c("Earth", "Mars"),
+                               selected = "Earth"),
+                   hr(),
+                   
+                   h5("Solve for:"),
+                   div(class = "solve-buttons",
+                       actionButton("solve_altitude", "Altitude"),
+                       actionButton("solve_velocity", "Velocity"),
+                       actionButton("solve_pressure", "Pressure")
+                   ),
+                   
+                   hr(),
+                   
+                   conditionalPanel(
+                       condition = "output.solve_mode != 'pressure'",
+                       h5("Chamber Pressure (×10⁻⁶ torr):"),
+                       fluidRow(
+                           column(12,
+                                  sliderInput("chamber_torr_slider", 
+                                              NULL,
+                                              min = 0.01,
+                                              max = 100,
+                                              value = 3,
+                                              step = 0.1)
+                           )
+                       ),
+                       fluidRow(
+                           column(12,
+                                  numericInput("chamber_torr_text",
+                                               NULL,
+                                               value = 3,
+                                               step = 0.1)
+                           )
+                       )
+                   ),
+                   
+                   conditionalPanel(
+                       condition = "output.solve_mode != 'velocity'",
+                       h5("Exit Velocity (m/s):"),
+                       fluidRow(
+                           column(12,
+                                  sliderInput("ev_slider",
+                                              NULL,
+                                              min = 100,
+                                              max = 8000,
+                                              value = 1350,
+                                              step = 50)
+                           )
+                       ),
+                       fluidRow(
+                           column(12,
+                                  numericInput("ev_text",
+                                               NULL,
+                                               value = 1350,
+                                               min = 100,
+                                               max = 8000,
+                                               step = 50)
+                           )
+                       )
+                   ),
+                   
+                   conditionalPanel(
+                       condition = "output.solve_mode != 'altitude'",
+                       h5("Target Altitude (km):"),
+                       fluidRow(
+                           column(12,
+                                  sliderInput("target_alt_slider",
+                                              NULL,
+                                              min = 0,
+                                              max = 400,
+                                              value = 127,
+                                              step = 1)
+                           )
+                       ),
+                       fluidRow(
+                           column(12,
+                                  numericInput("target_alt_text",
+                                               NULL,
+                                               value = 127,
+                                               min = 0,
+                                               max = 400,
+                                               step = 1)
+                           )
+                       )
+                   ),
+                   
+                   hr(),
+                   p("Density = 3P/v²", 
+                     style = "font-size: 0.9em; color: #666;")
+               )
+        ),
+        
+        column(8,
+               h4("Results"),
+               
+               conditionalPanel(
+                   condition = "output.solve_mode == 'altitude'",
+                   wellPanel(
+                       h5("Simulated Altitude"),
+                       h3(textOutput("altitude"), style = "color: #0066cc;")
+                   )
+               ),
+               
+               conditionalPanel(
+                   condition = "output.solve_mode == 'velocity'",
+                   wellPanel(
+                       h5("Required Exit Velocity"),
+                       h3(textOutput("required_velocity"), style = "color: #0066cc;")
+                   )
+               ),
+               
+               conditionalPanel(
+                   condition = "output.solve_mode == 'pressure'",
+                   wellPanel(
+                       h5("Required Chamber Pressure"),
+                       h3(textOutput("required_pressure"), style = "color: #0066cc;")
+                   )
+               ),
+               
+               wellPanel(
+                   h5("Chamber Conditions"),
+                   fluidRow(
+                       column(6,
+                              strong("Pressure (Pa):"),
+                              h4(textOutput("pressure_pa"))
+                       ),
+                       column(6,
+                              strong("Density (kg/m³):"),
+                              h4(textOutput("density"))
+                       )
+                   )
+               )
+        )
+    )
+)
+
+server <- function(input, output, session) {
+    
+    solve_mode <- reactiveVal("altitude")
+    
+    observe({
+        addClass("solve_altitude", "btn-active")
+    })
+    
+    observeEvent(input$solve_altitude, {
+        solve_mode("altitude")
+        removeClass("solve_velocity", "btn-active")
+        removeClass("solve_pressure", "btn-active")
+        addClass("solve_altitude", "btn-active")
+    })
+    
+    observeEvent(input$solve_velocity, {
+        solve_mode("velocity")
+        removeClass("solve_altitude", "btn-active")
+        removeClass("solve_pressure", "btn-active")
+        addClass("solve_velocity", "btn-active")
+    })
+    
+    observeEvent(input$solve_pressure, {
+        solve_mode("pressure")
+        removeClass("solve_altitude", "btn-active")
+        removeClass("solve_velocity", "btn-active")
+        addClass("solve_pressure", "btn-active")
+    })
+    
+    output$solve_mode <- reactive({ solve_mode() })
+    outputOptions(output, "solve_mode", suspendWhenHidden = FALSE)
+    
+    observeEvent(input$chamber_torr_slider, {
+        updateNumericInput(session, "chamber_torr_text", value = input$chamber_torr_slider)
+    })
+    
+    observeEvent(input$chamber_torr_text, {
+        updateSliderInput(session, "chamber_torr_slider", value = input$chamber_torr_text)
+    })
+    
+    observeEvent(input$ev_slider, {
+        updateNumericInput(session, "ev_text", value = input$ev_slider)
+    })
+    
+    observeEvent(input$ev_text, {
+        updateSliderInput(session, "ev_slider", value = input$ev_text)
+    })
+    
+    observeEvent(input$target_alt_slider, {
+        updateNumericInput(session, "target_alt_text", value = input$target_alt_slider)
+    })
+    
+    observeEvent(input$target_alt_text, {
+        updateSliderInput(session, "target_alt_slider", value = input$target_alt_text)
+    })
+    
+    results <- reactive({
+        mode <- solve_mode()
+        
+        if (mode == "altitude") {
+            chamber_pressure_pa <- input$chamber_torr_text * 1e-6 * 133.322
+            velocity <- input$ev_text
+            actual_density <- (3 * chamber_pressure_pa) / (velocity^2)
+            expected_altitude <- get_altitude_for_density(actual_density, input$planet)
+            
+            list(
+                mode = "altitude",
+                altitude = expected_altitude,
+                pressure_pa = chamber_pressure_pa,
+                density = actual_density,
+                planet = input$planet
+            )
+            
+        } else if (mode == "velocity") {
+            target_altitude <- input$target_alt_text
+            target_density <- get_density_for_altitude(target_altitude, input$planet)
+            chamber_pressure_pa <- input$chamber_torr_text * 1e-6 * 133.322
+            required_velocity <- sqrt((3 * chamber_pressure_pa) / target_density)
+            
+            list(
+                mode = "velocity",
+                required_velocity = required_velocity,
+                pressure_pa = chamber_pressure_pa,
+                density = target_density,
+                planet = input$planet
+            )
+            
+        } else {
+            target_altitude <- input$target_alt_text
+            target_density <- get_density_for_altitude(target_altitude, input$planet)
+            velocity <- input$ev_text
+            required_pressure_pa <- (target_density * velocity^2) / 3
+            required_pressure_torr <- (required_pressure_pa / 133.322) / 1e-6
+            
+            list(
+                mode = "pressure",
+                required_pressure_pa = required_pressure_pa,
+                required_pressure_torr = required_pressure_torr,
+                density = target_density,
+                planet = input$planet
+            )
+        }
+    })
+    
+    output$altitude <- renderText({
+        sprintf("%.1f km", results()$altitude)
+    })
+    
+    output$required_velocity <- renderText({
+        sprintf("%.0f m/s", results()$required_velocity)
+    })
+    
+    output$required_pressure <- renderText({
+        sprintf("%.2e torr", results()$required_pressure_torr * 1e-6)
+    })
+    
+    output$pressure_pa <- renderText({
+        if (results()$mode == "pressure") {
+            sprintf("%.2e Pa", results()$required_pressure_pa)
+        } else {
+            sprintf("%.2e Pa", results()$pressure_pa)
+        }
+    })
+    
+    output$density <- renderText({
+        sprintf("%.2e kg/m³", results()$density)
+    })
+}
+
+shinyApp(ui = ui, server = server)

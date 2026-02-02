@@ -5,6 +5,6 @@ account: bunea
 server: shinyapps.io
 hostUrl: https://api.shinyapps.io/v1
 appId: 16424808
-bundleId: 11470847
+bundleId: 11518429
 url: https://bunea.shinyapps.io/GWUThrust/
 version: 1

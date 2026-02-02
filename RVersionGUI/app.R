@@ -72,6 +72,23 @@ get_density_for_altitude <- function(altitude_km, planet = "Earth") {
     }
 }
 
+# Calculate feasible altitude range for voltage mode given current pressure and voltage limits
+get_feasible_altitude_range <- function(chamber_pressure_pa, planet) {
+    # Get temperature range from voltage calibration
+    temp_min_k <- min(voltage_temp_data$Temperature_K)
+    temp_max_k <- max(voltage_temp_data$Temperature_K)
+    
+    # For given pressure, calculate density range
+    density_max <- chamber_pressure_pa / (R_AIR * temp_min_k)  # Low temp = high density
+    density_min <- chamber_pressure_pa / (R_AIR * temp_max_k)  # High temp = low density
+    
+    # Convert to altitude range (high density = low altitude)
+    alt_min <- get_altitude_for_density(density_max, planet)
+    alt_max <- get_altitude_for_density(density_min, planet)
+    
+    return(list(min = alt_min, max = alt_max))
+}
+
 ui <- fluidPage(
     useShinyjs(),
     titlePanel("VLEO Chamber Verification"),
@@ -125,7 +142,7 @@ ui <- fluidPage(
                                         column(12,
                                                numericInput("chamber_torr_text",
                                                             NULL,
-                                                            value = 3)
+                                                            value = 1)
                                         )
                                     )
                                 ),
@@ -138,19 +155,19 @@ ui <- fluidPage(
                                                sliderInput("voltage_slider",
                                                            NULL,
                                                            min = 0,
-                                                           max = 120,
-                                                           value = 24,
-                                                           step = 1)
+                                                           max = 12,
+                                                           value = 1,
+                                                           step = 0.01)
                                         )
                                     ),
                                     fluidRow(
                                         column(12,
                                                numericInput("voltage_text",
                                                             NULL,
-                                                            value = 24,
                                                             min = 0,
-                                                            max = 120,
-                                                            step = 1)
+                                                            max = 12,
+                                                            value = 1,
+                                                            step = 0.01)
                                         )
                                     )
                                 ),
@@ -165,7 +182,7 @@ ui <- fluidPage(
                                                            min = 0,
                                                            max = 400,
                                                            value = 127,
-                                                           step = 1)
+                                                           step = 0.01)
                                         )
                                     ),
                                     fluidRow(
@@ -175,7 +192,7 @@ ui <- fluidPage(
                                                             value = 127,
                                                             min = 0,
                                                             max = 400,
-                                                            step = 1)
+                                                            step = 0.01)
                                         )
                                     )
                                 ),
@@ -240,7 +257,7 @@ ui <- fluidPage(
                                            h5("Inlet Mass Flow Rate (kg/s):"),
                                            numericInput("input_mass_flow",
                                                         NULL,
-                                                        value = 0.001,
+                                                        value = 0.005,
                                                         min = 0,
                                                         max = 1,
                                                         step = 0.0001)
@@ -302,8 +319,129 @@ server <- function(input, output, session) {
     output$solve_mode <- reactive({ solve_mode() })
     outputOptions(output, "solve_mode", suspendWhenHidden = FALSE)
     
-    observeEvent(input$chamber_torr_slider, {
-        updateNumericInput(session, "chamber_torr_text", value = input$chamber_torr_slider)
+    # Update slider limits based on mode
+    observe({
+        mode <- solve_mode()
+        
+        if (mode == "altitude") {
+            # Voltage slider limits based on calibration data
+            updateSliderInput(session, "voltage_slider",
+                              min = round(min(voltage_temp_data$Voltage_V), 2),
+                              max = round(max(voltage_temp_data$Voltage_V), 2))
+            updateNumericInput(session, "voltage_text",
+                               min = round(min(voltage_temp_data$Voltage_V), 2),
+                               max = round(max(voltage_temp_data$Voltage_V), 2))
+            
+        } else if (mode == "voltage") {
+            # Calculate feasible altitude range based on current pressure
+            chamber_pressure_pa <- input$chamber_torr_text * 133.322
+            alt_range <- get_feasible_altitude_range(chamber_pressure_pa, input$planet)
+            
+            # Constrain by atmospheric data too
+            if (input$planet == "Earth") {
+                data_alt_min <- min(atm_data_earth$Altitude_km)
+                data_alt_max <- max(atm_data_earth$Altitude_km)
+            } else {
+                data_alt_min <- min(atm_data_mars$Altitude_km)
+                data_alt_max <- max(atm_data_mars$Altitude_km)
+            }
+            
+            final_min <- round(max(alt_range$min, data_alt_min, na.rm = TRUE), 2)
+            final_max <- round(min(alt_range$max, data_alt_max, na.rm = TRUE), 2)
+            
+            updateSliderInput(session, "target_alt_slider",
+                              min = final_min,
+                              max = final_max,
+                              value = round(min(max(input$target_alt_text, final_min), final_max), 2))
+            updateNumericInput(session, "target_alt_text",
+                               min = final_min,
+                               max = final_max,
+                               value = round(min(max(input$target_alt_text, final_min), final_max), 2))
+            
+        } else if (mode == "pressure") {
+            # Target altitude limited by atmospheric data
+            if (input$planet == "Earth") {
+                alt_min <- round(min(atm_data_earth$Altitude_km), 2)
+                alt_max <- round(max(atm_data_earth$Altitude_km), 2)
+            } else {
+                alt_min <- round(min(atm_data_mars$Altitude_km), 2)
+                alt_max <- round(max(atm_data_mars$Altitude_km), 2)
+            }
+            
+            updateSliderInput(session, "target_alt_slider",
+                              min = alt_min,
+                              max = alt_max)
+            updateNumericInput(session, "target_alt_text",
+                               min = alt_min,
+                               max = alt_max)
+            
+            # Voltage slider limits
+            updateSliderInput(session, "voltage_slider",
+                              min = round(min(voltage_temp_data$Voltage_V), 2),
+                              max = round(max(voltage_temp_data$Voltage_V), 2))
+            updateNumericInput(session, "voltage_text",
+                               min = round(min(voltage_temp_data$Voltage_V), 2),
+                               max = round(max(voltage_temp_data$Voltage_V), 2))
+        }
+    })
+    
+    # Update altitude limits when planet changes
+    observeEvent(input$planet, {
+        if (solve_mode() %in% c("voltage", "pressure")) {
+            if (input$planet == "Earth") {
+                alt_min <- min(atm_data_earth$Altitude_km)
+                alt_max <- max(atm_data_earth$Altitude_km)
+            } else {
+                alt_min <- min(atm_data_mars$Altitude_km)
+                alt_max <- max(atm_data_mars$Altitude_km)
+            }
+            
+            # For voltage mode, also need to check feasibility
+            if (solve_mode() == "voltage") {
+                chamber_pressure_pa <- input$chamber_torr_text * 133.322
+                alt_range <- get_feasible_altitude_range(chamber_pressure_pa, input$planet)
+                alt_min <- max(alt_range$min, alt_min, na.rm = TRUE)
+                alt_max <- min(alt_range$max, alt_max, na.rm = TRUE)
+            }
+            
+            alt_min <- round(alt_min, 2)
+            alt_max <- round(alt_max, 2)
+            
+            updateSliderInput(session, "target_alt_slider",
+                              min = alt_min,
+                              max = alt_max,
+                              value = round(min(max(input$target_alt_text, alt_min), alt_max), 2))
+            updateNumericInput(session, "target_alt_text",
+                               min = alt_min,
+                               max = alt_max,
+                               value = round(min(max(input$target_alt_text, alt_min), alt_max), 2))
+        }
+    })
+    
+    # Update altitude limits when pressure changes in voltage mode
+    observeEvent(input$chamber_torr_text, {
+        if (solve_mode() == "voltage") {
+            chamber_pressure_pa <- input$chamber_torr_text * 133.322
+            alt_range <- get_feasible_altitude_range(chamber_pressure_pa, input$planet)
+            
+            if (input$planet == "Earth") {
+                data_alt_min <- min(atm_data_earth$Altitude_km)
+                data_alt_max <- max(atm_data_earth$Altitude_km)
+            } else {
+                data_alt_min <- min(atm_data_mars$Altitude_km)
+                data_alt_max <- max(atm_data_mars$Altitude_km)
+            }
+            
+            final_min <- round(max(alt_range$min, data_alt_min, na.rm = TRUE), 2)
+            final_max <- round(min(alt_range$max, data_alt_max, na.rm = TRUE), 2)
+            
+            updateSliderInput(session, "target_alt_slider",
+                              min = final_min,
+                              max = final_max)
+            updateNumericInput(session, "target_alt_text",
+                               min = final_min,
+                               max = final_max)
+        }
     })
     
     observeEvent(input$voltage_slider, {
@@ -343,12 +481,13 @@ server <- function(input, output, session) {
         } else if (mode == "voltage") {
             target_altitude <- input$target_alt_text
             target_density <- get_density_for_altitude(target_altitude, input$planet)
-            chamber_pressure_pa <- input$chamber_torr_text * 1e-6 * 133.322
+            chamber_pressure_pa <- input$chamber_torr_text * 133.322
             
             required_temp_k <- chamber_pressure_pa / (R_AIR * target_density)
-            required_voltage <- approx(voltage_temp_data$Temperature_K, 
+            required_temp_c <- required_temp_k - 273.15
+            required_voltage <- approx(voltage_temp_data$Temp_C, 
                                        voltage_temp_data$Voltage_V, 
-                                       required_temp_k)$y
+                                       required_temp_c)$y
             
             list(
                 mode = "voltage",
@@ -365,7 +504,7 @@ server <- function(input, output, session) {
             temp_k <- get_temp_from_voltage(input$voltage_text, voltage_temp_data)
             
             required_pressure_pa <- target_density * R_AIR * temp_k
-            required_pressure_torr <- (required_pressure_pa / 133.322) / 1e-6
+            required_pressure_torr <- (required_pressure_pa / 133.322)
             
             list(
                 mode = "pressure",
@@ -404,7 +543,7 @@ server <- function(input, output, session) {
     })
     
     output$required_pressure <- renderText({
-        sprintf("%.2e torr", results()$required_pressure_torr * 1e-6)
+        sprintf("%.2e torr", results()$required_pressure_torr)
     })
     
     output$pressure_pa <- renderText({

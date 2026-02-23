@@ -6,11 +6,15 @@ library(rvest)
 library(dplyr)
 
 # Physical constants
-R_AIR <- 287.05
-INPUT_AIR_TEMP_K <- 20 + 273.15
-GAMMA_AIR <- 1.4
-MACH_COMPRESSIBLE_THRESHOLD <- 0.3
-TORR_TO_PA <- 133.322
+R_AIR                          <- 287.05
+INPUT_AIR_TEMP_K               <- 20 + 273.15
+DEFAULT_STEADY_STATE_EXIT_TEMP_K <- 100 + 273.15
+GAMMA_AIR                      <- 1.4
+MACH_COMPRESSIBLE_THRESHOLD    <- 0.3
+TORR_TO_PA                     <- 133.322
+NOZZLE_EXIT_MM                 <- 92.38
+NOZZLE_EXIT_M                  <- NOZZLE_EXIT_MM / 1000
+NOZZLE_EXIT_AREA_M2            <- pi * (NOZZLE_EXIT_M / 2)^2
 
 # --- Data loaders ---
 
@@ -25,7 +29,7 @@ load_mars_data <- function() {
     df <- read_html(url_mars) %>% html_table() %>% .[[3]] %>% .[-2,]
     colnames(df) <- df[1,]
     df <- df[-1,]
-    df$Altitude_km <- as.numeric(gsub(",", "", df$`Altitude(meters)`)) / 1000
+    df$Altitude_km   <- as.numeric(gsub(",", "", df$`Altitude(meters)`)) / 1000
     df$density_kg_m3 <- as.numeric(df$`Density(kg/m3)`)
     return(df)
 }
@@ -36,16 +40,11 @@ load_voltage_temp_data <- function(csv_file = 'data/dummy_voltageVtemp.csv') {
     return(df)
 }
 
-# Load data at startup
-atm_data_earth <- load_atmospheric_data()
-atm_data_mars <- load_mars_data()
+atm_data_earth    <- load_atmospheric_data()
+atm_data_mars     <- load_mars_data()
 voltage_temp_data <- load_voltage_temp_data()
 
-# --- Physics helpers ---
-
-get_temp_from_voltage <- function(voltage_v) {
-    approx(voltage_temp_data$Voltage_V, voltage_temp_data$Temperature_K, voltage_v)$y
-}
+# --- Atmospheric helpers ---
 
 get_atm_data <- function(planet) {
     if (planet == "Mars") atm_data_mars else atm_data_earth
@@ -66,51 +65,36 @@ get_planet_alt_bounds <- function(planet) {
     list(min = min(d$Altitude_km), max = max(d$Altitude_km))
 }
 
-get_feasible_altitude_range <- function(chamber_pressure_pa, planet) {
-    temp_min_k <- min(voltage_temp_data$Temperature_K)
-    temp_max_k <- max(voltage_temp_data$Temperature_K)
-    density_max <- chamber_pressure_pa / (R_AIR * temp_min_k)
-    density_min <- chamber_pressure_pa / (R_AIR * temp_max_k)
-    list(
-        min = get_altitude_for_density(density_max, planet),
-        max = get_altitude_for_density(density_min, planet)
-    )
+# --- Nozzle physics ---
+
+get_exit_density <- function(p_pa, t_exit_k) {
+    p_pa / (R_AIR * t_exit_k)
 }
 
-# Isentropic exit density (M >= 0.3): rho_exit = rho_in * (Te/Ti)^(1/(gamma-1))
-calc_rho_isentropic <- function(rho_input, te, ti, gam) {
-    rho_input * (te / ti)^(1.0 / (gam - 1.0))
+calc_exit_velocity <- function(mdot, rho_exit, area) {
+    if (is.na(rho_exit) || rho_exit <= 0 || area <= 0) return(NA_real_)
+    mdot / (rho_exit * area)
 }
 
-# Isentropic exit velocity (M >= 0.3): v = a * sqrt((Te/Ti - 1) * 2/(gamma-1))
-calc_v_isentropic <- function(te, ti, gam) {
-    a <- sqrt(gam * R_AIR * ti)
-    a * sqrt((te / ti - 1.0) * 2.0 / (gam - 1.0))
+calc_exit_mach <- function(v_exit, t_exit_k, gam) {
+    a_exit <- sqrt(gam * R_AIR * t_exit_k)
+    if (a_exit <= 0) return(NA_real_)
+    v_exit / a_exit
 }
 
-# --- UI update helpers ---
-
-update_voltage_limits <- function(session) {
-    v_min <- round(min(voltage_temp_data$Voltage_V), 2)
-    v_max <- round(max(voltage_temp_data$Voltage_V), 2)
-    updateSliderInput(session, "voltage_slider", min = v_min, max = v_max)
-    updateNumericInput(session, "voltage_text", min = v_min, max = v_max)
+get_flow_regime <- function(mach) {
+    if (is.na(mach)) return("N/A")
+    if (mach >= MACH_COMPRESSIBLE_THRESHOLD) "Isentropic (M \u2265 0.3)" else "Ideal Gas (M < 0.3)"
 }
+
+# --- UI helper ---
 
 update_alt_limits <- function(session, alt_min, alt_max, current_val = NULL) {
-    alt_min <- round(alt_min, 2); alt_max <- round(alt_max, 2)
+    alt_min <- round(alt_min, 2)
+    alt_max <- round(alt_max, 2)
     clamped <- if (!is.null(current_val)) round(min(max(current_val, alt_min), alt_max), 2)
-    updateSliderInput(session, "target_alt_slider", min=alt_min, max=alt_max, value=clamped)
-    updateNumericInput(session, "target_alt_text", min=alt_min, max=alt_max, value=clamped)
-}
-
-get_voltage_mode_alt_bounds <- function(pressure_torr, planet) {
-    alt_range <- get_feasible_altitude_range(pressure_torr * TORR_TO_PA, planet)
-    data_bounds <- get_planet_alt_bounds(planet)
-    list(
-        min = max(alt_range$min, data_bounds$min, na.rm = TRUE),
-        max = min(alt_range$max, data_bounds$max, na.rm = TRUE)
-    )
+    updateSliderInput(session,  "target_alt_slider", min = alt_min, max = alt_max, value = clamped)
+    updateNumericInput(session, "target_alt_text",   min = alt_min, max = alt_max, value = clamped)
 }
 
 # ============================================================
@@ -131,51 +115,66 @@ ui <- fluidPage(
             column(4, wellPanel(
                 h4("Chamber Conditions"),
                 selectInput("planet", "Atmospheric Body:",
-                            choices = c("Earth","Mars"), selected = "Earth"),
+                            choices = c("Earth", "Mars"), selected = "Earth"),
                 hr(),
                 h5("Solve for:"),
                 div(class = "solve-buttons",
                     actionButton("solve_altitude", "Altitude"),
-                    actionButton("solve_voltage", "Voltage"),
                     actionButton("solve_pressure", "Pressure")),
+                hr(),
+                h5("Steady-State Exit Temperature (\u00B0C):"),
+                numericInput("exit_temp_c", NULL,
+                             value = round(DEFAULT_STEADY_STATE_EXIT_TEMP_K - 273.15, 1),
+                             min   = round(INPUT_AIR_TEMP_K - 273.15 + 0.1, 1),
+                             max   = 1000,
+                             step  = 1),
                 hr(),
                 conditionalPanel("output.solve_mode != 'pressure'",
                                  h5("Chamber Pressure (torr):"),
-                                 numericInput("chamber_torr_text", NULL, value = 1)),
-                conditionalPanel("output.solve_mode != 'voltage'",
-                                 h5("Heating Cartridge Voltage (V):"),
-                                 sliderInput("voltage_slider", NULL, min=0, max=12, value=1, step=0.01),
-                                 numericInput("voltage_text", NULL, min=0, max=12, value=1, step=0.01)),
+                                 numericInput("chamber_torr_text", NULL, value = 1, min = 0)),
                 conditionalPanel("output.solve_mode != 'altitude'",
                                  h5("Target Altitude (km):"),
-                                 sliderInput("target_alt_slider", NULL, min=0, max=400, value=127, step=0.01),
-                                 numericInput("target_alt_text", NULL, value=127, min=0, max=400, step=0.01)),
+                                 sliderInput("target_alt_slider", NULL,
+                                             min = 0, max = 400, value = 127, step = 0.01),
+                                 numericInput("target_alt_text", NULL,
+                                              value = 127, min = 0, max = 400, step = 0.01)),
                 hr(),
-                p(sprintf("T_in: %.2f K | \u03B3: %.1f", INPUT_AIR_TEMP_K, GAMMA_AIR),
+                h5("Input Mass Flow Rate (kg/s):"),
+                numericInput("mdot", NULL, value = 1e-5, min = 0, step = 1e-6),
+                hr(),
+                p(sprintf("T_in: %.2f K | \u03B3: %.1f | Nozzle \u00D8: %.2f mm | A_exit: %.4e m\u00B2",
+                          INPUT_AIR_TEMP_K, GAMMA_AIR, NOZZLE_EXIT_MM, NOZZLE_EXIT_AREA_M2),
                   style = "font-size:0.9em; color:#666;")
             )),
             column(8,
                    h4("Results"),
+                   # Warning if exit temp <= inlet temp
+                   uiOutput("temp_warning"),
                    conditionalPanel("output.solve_mode == 'altitude'", wellPanel(
                        h4("Simulated Altitude"),
                        h3(textOutput("altitude"), style = "color:#0066cc;"))),
-                   conditionalPanel("output.solve_mode == 'voltage'", wellPanel(
-                       h5("Required Heating Voltage"),
-                       h3(textOutput("required_voltage"), style = "color:#0066cc;"))),
                    conditionalPanel("output.solve_mode == 'pressure'", wellPanel(
                        h5("Required Chamber Pressure"),
                        h3(textOutput("required_pressure"), style = "color:#0066cc;"))),
                    wellPanel(h4("Chamber Conditions"), fluidRow(
-                       column(4, strong("Pressure (Pa):"), h4(textOutput("pressure_pa"))),
-                       column(4, strong("Exit Temp (K):"), h4(textOutput("temperature_k"))),
-                       column(4, strong("Chamber \u03C1 (kg/m\u00B3):"), h4(textOutput("density"))))),
+                       column(4, strong("Pressure (Pa):"),
+                              h4(textOutput("pressure_pa"))),
+                       column(4, strong("Exit Temp (K):"),
+                              h4(textOutput("temperature_k"))),
+                       column(4, strong("Chamber \u03C1 (kg/m\u00B3):"),
+                              h4(textOutput("chamber_density"))))),
                    wellPanel(h4("Nozzle Performance"), fluidRow(
                        column(6, strong("Flow Regime:"),
                               h4(textOutput("flow_regime"), style = "color:#cc6600;")),
-                       column(6, strong("Exit Mach:"), h4(textOutput("exit_mach")))),
+                       column(6, strong("Mach (continuity est.):"),
+                              h4(textOutput("exit_mach")))),
                        hr(), fluidRow(
-                           column(6, strong("Exit \u03C1 (kg/m\u00B3):"), h4(textOutput("exit_density"))),
-                           column(6, strong("Exit Vel (m/s):"), h4(textOutput("exit_velocity")))))
+                           column(4, strong("Exit \u03C1 (kg/m\u00B3):"),
+                                  h4(textOutput("exit_density"))),
+                           column(4, strong("\u1E41 (kg/s):"),
+                                  h4(textOutput("mdot_display"))),
+                           column(4, strong("Exit Vel (m/s):"),
+                                  h4(textOutput("exit_velocity")))))
             )
         )),
         tabPanel("Chamber Results", fluidRow(column(12, h1("Results Here"))))
@@ -191,118 +190,96 @@ server <- function(input, output, session) {
     solve_mode <- reactiveVal("altitude")
     observe({ addClass("solve_altitude", "btn-active") })
     
-    # Consolidated solve-mode switching
     set_mode <- function(mode) {
         solve_mode(mode)
-        for (m in c("altitude", "voltage", "pressure")) {
+        for (m in c("altitude", "pressure")) {
             btn <- paste0("solve_", m)
             if (m == mode) addClass(btn, "btn-active") else removeClass(btn, "btn-active")
         }
     }
     observeEvent(input$solve_altitude, set_mode("altitude"))
-    observeEvent(input$solve_voltage,  set_mode("voltage"))
     observeEvent(input$solve_pressure, set_mode("pressure"))
     
     output$solve_mode <- reactive({ solve_mode() })
     outputOptions(output, "solve_mode", suspendWhenHidden = FALSE)
     
-    # Slider limits based on mode
-    observe({
-        mode <- solve_mode()
-        if (mode %in% c("altitude", "pressure")) update_voltage_limits(session)
-        if (mode == "voltage") {
-            b <- get_voltage_mode_alt_bounds(input$chamber_torr_text, input$planet)
-            update_alt_limits(session, b$min, b$max, input$target_alt_text)
-        } else if (mode == "pressure") {
-            b <- get_planet_alt_bounds(input$planet)
-            update_alt_limits(session, b$min, b$max)
-        }
-    })
-    
     observeEvent(input$planet, {
-        if (solve_mode() %in% c("voltage", "pressure")) {
-            b <- if (solve_mode() == "voltage") {
-                get_voltage_mode_alt_bounds(input$chamber_torr_text, input$planet)
-            } else {
-                get_planet_alt_bounds(input$planet)
-            }
+        if (solve_mode() == "pressure") {
+            b <- get_planet_alt_bounds(input$planet)
             update_alt_limits(session, b$min, b$max, input$target_alt_text)
         }
     })
     
-    observeEvent(input$chamber_torr_text, {
-        if (solve_mode() == "voltage") {
-            b <- get_voltage_mode_alt_bounds(input$chamber_torr_text, input$planet)
-            update_alt_limits(session, b$min, b$max)
+    observeEvent(input$target_alt_slider,
+                 updateNumericInput(session, "target_alt_text", value = input$target_alt_slider))
+    observeEvent(input$target_alt_text,
+                 updateSliderInput(session, "target_alt_slider", value = input$target_alt_text))
+    
+    # Warn if exit temp is at or below inlet temp (physics would break)
+    output$temp_warning <- renderUI({
+        t_exit_k <- input$exit_temp_c + 273.15
+        if (!is.na(t_exit_k) && t_exit_k <= INPUT_AIR_TEMP_K) {
+            div(style = "background:#fff3cd; border:1px solid #ffc107; padding:10px;
+                         border-radius:4px; margin-bottom:10px;",
+                strong("\u26A0 Warning: "),
+                sprintf("Exit temperature (%.1f K) must exceed inlet temperature (%.1f K).",
+                        t_exit_k, INPUT_AIR_TEMP_K))
         }
     })
-    
-    # Sync slider <-> numeric
-    observeEvent(input$voltage_slider,    updateNumericInput(session, "voltage_text", value=input$voltage_slider))
-    observeEvent(input$voltage_text,      updateSliderInput(session, "voltage_slider", value=input$voltage_text))
-    observeEvent(input$target_alt_slider, updateNumericInput(session, "target_alt_text", value=input$target_alt_slider))
-    observeEvent(input$target_alt_text,   updateSliderInput(session, "target_alt_slider", value=input$target_alt_text))
     
     # --- Core chamber calculations ---
     results <- reactive({
-        mode <- solve_mode()
+        t_exit_k <- input$exit_temp_c + 273.15
+        mode     <- solve_mode()
+        
         if (mode == "altitude") {
-            p_pa <- input$chamber_torr_text * TORR_TO_PA
-            te <- get_temp_from_voltage(input$voltage_text)
-            rho <- p_pa / (R_AIR * te)
-            list(mode=mode, altitude=get_altitude_for_density(rho, input$planet),
-                 pressure_pa=p_pa, te=te, chamber_density=rho)
-        } else if (mode == "voltage") {
-            rho_t <- get_density_for_altitude(input$target_alt_text, input$planet)
-            p_pa <- input$chamber_torr_text * TORR_TO_PA
-            te <- p_pa / (R_AIR * rho_t)
-            req_v <- approx(voltage_temp_data$Temp_C, voltage_temp_data$Voltage_V, te-273.15)$y
-            list(mode=mode, required_voltage=req_v, te=te,
-                 pressure_pa=p_pa, chamber_density=rho_t)
+            p_pa        <- input$chamber_torr_text * TORR_TO_PA
+            rho_chamber <- p_pa / (R_AIR * t_exit_k)
+            list(
+                mode            = mode,
+                altitude        = get_altitude_for_density(rho_chamber, input$planet),
+                pressure_pa     = p_pa,
+                t_exit_k        = t_exit_k,
+                chamber_density = rho_chamber
+            )
         } else {
-            rho_t <- get_density_for_altitude(input$target_alt_text, input$planet)
-            te <- get_temp_from_voltage(input$voltage_text)
-            req_pa <- rho_t * R_AIR * te
-            list(mode=mode, required_pressure_pa=req_pa,
-                 required_pressure_torr=req_pa/TORR_TO_PA, te=te, chamber_density=rho_t)
+            rho_t  <- get_density_for_altitude(input$target_alt_text, input$planet)
+            req_pa <- rho_t * R_AIR * t_exit_k
+            list(
+                mode                   = mode,
+                required_pressure_pa   = req_pa,
+                required_pressure_torr = req_pa / TORR_TO_PA,
+                t_exit_k               = t_exit_k,
+                chamber_density        = rho_t,
+                pressure_pa            = req_pa
+            )
         }
     })
     
-    # --- Nozzle: Mach 0.3 threshold switching ---
-    # Isentropic velocity is always valid (Te > Ti guaranteed by calibration).
-    # Below M 0.3: compressibility negligible, use ideal gas for density.
-    # At/above M 0.3: use isentropic density.
+    # --- Nozzle reactive ---
     nozzle <- reactive({
-        r <- results()
-        te <- r$te; ti <- INPUT_AIR_TEMP_K; gam <- GAMMA_AIR
-        p_pa <- if (r$mode == "pressure") r$required_pressure_pa else r$pressure_pa
-        a_out <- sqrt(gam * R_AIR * te)
+        r        <- results()
+        p_pa     <- r$pressure_pa
+        te       <- r$t_exit_k
         
-        v_exit <- calc_v_isentropic(te, ti, gam)
-        mach <- v_exit / a_out
+        rho_exit <- get_exit_density(p_pa, te)
+        v_exit   <- calc_exit_velocity(input$mdot, rho_exit, NOZZLE_EXIT_AREA_M2)
+        mach     <- calc_exit_mach(v_exit, te, GAMMA_AIR)
+        regime   <- get_flow_regime(mach)
         
-        if (mach >= MACH_COMPRESSIBLE_THRESHOLD) {
-            rho_in <- p_pa / (R_AIR * ti)
-            list(rho=calc_rho_isentropic(rho_in, te, ti, gam),
-                 v=v_exit, mach=mach,
-                 regime="Isentropic (M \u2265 0.3)")
-        } else {
-            list(rho=p_pa/(R_AIR*te), v=v_exit, mach=mach,
-                 regime="Ideal Gas (M < 0.3)")
-        }
+        list(rho = rho_exit, v = v_exit, mach = mach, regime = regime)
     })
     
     # --- Outputs ---
-    output$altitude          <- renderText(sprintf("%.1f km", results()$altitude))
-    output$required_voltage  <- renderText(sprintf("%.1f V (\u2192 %.0f K)", results()$required_voltage, results()$te))
-    output$required_pressure <- renderText(sprintf("%.2e torr", results()$required_pressure_torr))
-    output$pressure_pa <- renderText(sprintf("%.2e",
-                                             if (results()$mode == "pressure") results()$required_pressure_pa else results()$pressure_pa))
-    output$temperature_k     <- renderText(sprintf("%.0f", results()$te))
-    output$density           <- renderText(sprintf("%.2e kg/m\u00B3", results()$chamber_density))
-    output$exit_density      <- renderText(sprintf("%.2e", nozzle()$rho))
-    output$exit_velocity     <- renderText(sprintf("%.1f", nozzle()$v))
-    output$exit_mach         <- renderText(sprintf("%.4f", nozzle()$mach))
+    output$altitude          <- renderText(sprintf("%.1f km",          results()$altitude))
+    output$required_pressure <- renderText(sprintf("%.2e torr",        results()$required_pressure_torr))
+    output$pressure_pa       <- renderText(sprintf("%.2e Pa",          results()$pressure_pa))
+    output$temperature_k     <- renderText(sprintf("%.1f K",           results()$t_exit_k))
+    output$chamber_density   <- renderText(sprintf("%.2e kg/m\u00B3",  results()$chamber_density))
+    output$exit_density      <- renderText(sprintf("%.2e kg/m\u00B3",  nozzle()$rho))
+    output$mdot_display      <- renderText(sprintf("%.2e kg/s",        input$mdot))
+    output$exit_velocity     <- renderText(sprintf("%.4f m/s",         nozzle()$v))
+    output$exit_mach         <- renderText(sprintf("%.4f",             nozzle()$mach))
     output$flow_regime       <- renderText(nozzle()$regime)
 }
 

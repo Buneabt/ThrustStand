@@ -1,5 +1,6 @@
 # VLEO Chamber Verification
 # GWU Systems Engineering Capstone Project
+
 library(shiny)
 library(shinyjs)
 library(rvest)
@@ -7,7 +8,8 @@ library(dplyr)
 
 # --- Constants ---
 R_AIR                            <- 287.05
-INPUT_AIR_TEMP_K                 <- 20 + 273.15
+AMBIENT_TEMP_K                   <- 20 + 273.15   # ambient/downstream reference temperature
+INPUT_AIR_TEMP_K                 <- AMBIENT_TEMP_K # retained for legacy label in UI footer
 DEFAULT_STEADY_STATE_EXIT_TEMP_K <- 100 + 273.15
 GAMMA_AIR                        <- 1.4
 MACH_COMPRESSIBLE_THRESHOLD      <- 0.3
@@ -57,30 +59,33 @@ get_planet_alt_bounds <- function(planet) {
 }
 
 # --- Physics ---
+# Exit density from ideal gas law at nozzle exit plane
 calc_exit_density <- function(p_pa, t_exit_k) {
     p_pa / (R_AIR * t_exit_k)
 }
 
-calc_exit_velocity <- function(mdot, rho_exit, area) {
-    if (is.na(rho_exit) || rho_exit <= 0 || area <= 0) return(NA_real_)
-    mdot / (rho_exit * area)
+# Isentropic exit velocity from stagnation enthalpy drop.
+# t_stag_k: stagnation (reservoir) temperature — the heated nozzle exit temp input by user.
+# t_amb_k:  ambient downstream temperature — INPUT_AIR_TEMP_K (293.15 K).
+# v = sqrt(2 * gamma * R / (gamma - 1) * T_stag * (1 - T_amb / T_stag))
+# Valid when T_stag > T_amb (i.e. exit temp must exceed ambient — enforced by guard).
+calc_isentropic_exit_velocity <- function(t_stag_k, t_amb_k) {
+    if (is.na(t_stag_k) || is.na(t_amb_k) || t_stag_k <= t_amb_k) return(NA_real_)
+    ratio <- t_amb_k / t_stag_k
+    sqrt(2 * GAMMA_AIR * R_AIR / (GAMMA_AIR - 1) * t_stag_k * (1 - ratio))
 }
 
+# Exit Mach number from velocity and local speed of sound
 calc_exit_mach <- function(v_exit, t_exit_k) {
     a_exit <- sqrt(GAMMA_AIR * R_AIR * t_exit_k)
     if (a_exit <= 0) return(NA_real_)
     v_exit / a_exit
 }
 
-calc_max_mach <- function(t_exit_k, t_in_k) {
-    ratio <- t_exit_k / t_in_k - 1
-    if (ratio <= 0) return(NA_real_)
-    sqrt(2 / (GAMMA_AIR - 1) * ratio)
-}
-
-calc_max_velocity <- function(m_max, t_exit_k) {
-    if (is.na(m_max)) return(NA_real_)
-    m_max * sqrt(GAMMA_AIR * R_AIR * t_exit_k)
+# Back-calculated exit mass flow rate from continuity: mdot = rho * v * A
+calc_exit_mdot <- function(rho_exit, v_exit, area) {
+    if (is.na(rho_exit) || is.na(v_exit) || rho_exit <= 0) return(NA_real_)
+    rho_exit * v_exit * area
 }
 
 # --- UI Helper ---
@@ -140,7 +145,6 @@ ui <- fluidPage(
             column(8,
                    h4("Results"),
                    uiOutput("temp_warning"),
-                   uiOutput("velocity_warning"),
                    conditionalPanel("output.solve_mode == 'altitude'", wellPanel(
                        h4("Simulated Altitude"),
                        h3(textOutput("altitude"), style = "color:#0066cc;"))),
@@ -148,15 +152,14 @@ ui <- fluidPage(
                        h5("Required Chamber Pressure"),
                        h3(textOutput("required_pressure"), style = "color:#0066cc;"))),
                    wellPanel(h4("Chamber Conditions"), fluidRow(
-                       column(4, strong("Pressure (Pa):"),          h4(textOutput("pressure_pa"))),
-                       column(4, strong("Exit Temp (K):"),          h4(textOutput("temperature_k"))),
+                       column(4, strong("Pressure (Pa):"),            h4(textOutput("pressure_pa"))),
+                       column(4, strong("Exit Temp (K):"),            h4(textOutput("temperature_k"))),
                        column(4, strong("Exit \u03C1 (kg/m\u00B3):"), h4(textOutput("exit_density"))))),
                    wellPanel(h4("Nozzle Performance"), fluidRow(
-                       column(3, strong("\u1E41 (kg/s):"),      h4(textOutput("mdot_display"))),
-                       column(3, strong("Exit Vel (m/s):"),  h4(textOutput("exit_velocity"))),
-                       column(3, strong("Exit Mach:"),       h4(textOutput("exit_mach"))),
-                       column(3, strong("Max Vel (m/s):"),   h4(textOutput("max_velocity"),
-                                                                style = "color:#cc6600;"))))
+                       column(3, strong("\u1E41 in (kg/s):"),    h4(textOutput("mdot_display"))),
+                       column(3, strong("Exit Vel (m/s):"),      h4(textOutput("exit_velocity"))),
+                       column(3, strong("Exit Mach:"),           h4(textOutput("exit_mach"))),
+                       column(3, strong("\u1E41 exit (kg/s):"),  h4(textOutput("mdot_exit_display")))))
             )
         )),
         tabPanel("Chamber Results", fluidRow(column(12, h1("Results Here"))))
@@ -203,11 +206,11 @@ server <- function(input, output, session) {
             p_pa     <- input$chamber_torr_text * TORR_TO_PA
             rho_exit <- calc_exit_density(p_pa, t_exit_k)
             list(
-                mode       = mode,
-                altitude   = get_altitude_for_density(rho_exit, input$planet),
+                mode        = mode,
+                altitude    = get_altitude_for_density(rho_exit, input$planet),
                 pressure_pa = p_pa,
-                t_exit_k   = t_exit_k,
-                rho_exit   = rho_exit
+                t_exit_k    = t_exit_k,
+                rho_exit    = rho_exit
             )
         } else {
             rho_t  <- get_density_for_altitude(input$target_alt_text, input$planet)
@@ -223,12 +226,11 @@ server <- function(input, output, session) {
     })
     
     nozzle <- reactive({
-        r        <- results()
-        v_exit   <- calc_exit_velocity(input$mdot, r$rho_exit, NOZZLE_EXIT_AREA_M2)
-        mach     <- calc_exit_mach(v_exit, r$t_exit_k)
-        m_max    <- calc_max_mach(r$t_exit_k, INPUT_AIR_TEMP_K)
-        v_max    <- calc_max_velocity(m_max, r$t_exit_k)
-        list(v = v_exit, mach = mach, v_max = v_max)
+        r         <- results()
+        v_exit    <- calc_isentropic_exit_velocity(r$t_exit_k, INPUT_AIR_TEMP_K)
+        mach      <- calc_exit_mach(v_exit, r$t_exit_k)
+        mdot_exit <- calc_exit_mdot(r$rho_exit, v_exit, NOZZLE_EXIT_AREA_M2)
+        list(v = v_exit, mach = mach, mdot_exit = mdot_exit)
     })
     
     # --- Warnings ---
@@ -243,17 +245,6 @@ server <- function(input, output, session) {
         }
     })
     
-    output$velocity_warning <- renderUI({
-        n <- nozzle()
-        if (!is.na(n$v) && !is.na(n$v_max) && n$v > n$v_max) {
-            div(style = "background:#f8d7da; border:1px solid #dc3545; padding:10px;
-                         border-radius:4px; margin-bottom:10px;",
-                strong("\u26A0 Warning: "),
-                sprintf("Exit velocity (%.1f m/s) exceeds thermodynamic maximum (%.1f m/s).
-                         Increase T_exit or reduce \u1E41.", n$v, n$v_max))
-        }
-    })
-    
     # --- Outputs ---
     output$altitude          <- renderText(sprintf("%.1f km",          results()$altitude))
     output$required_pressure <- renderText(sprintf("%.2e torr",        results()$required_pressure_torr))
@@ -263,7 +254,7 @@ server <- function(input, output, session) {
     output$mdot_display      <- renderText(sprintf("%.2e kg/s",        input$mdot))
     output$exit_velocity     <- renderText(sprintf("%.2f m/s",         nozzle()$v))
     output$exit_mach         <- renderText(sprintf("%.4f",             nozzle()$mach))
-    output$max_velocity      <- renderText(sprintf("%.2f m/s",         nozzle()$v_max))
+    output$mdot_exit_display <- renderText(sprintf("%.2e kg/s",        nozzle()$mdot_exit))
 }
 
 shinyApp(ui = ui, server = server)
